@@ -29,6 +29,11 @@
             </intent-filter>
         </activity>
 
+        <activity
+            android:name=".ui.SettingsActivity"
+            android:exported="false"
+            android:parentActivityName=".ui.MapActivity" />
+
         <service
             android:name=".ntrip.NtripClient"
             android:exported="false"

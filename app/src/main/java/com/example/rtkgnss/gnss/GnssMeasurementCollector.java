@@ -1,6 +1,7 @@
 package com.example.rtkgnss.gnss;
 
 import android.content.Context;
+import android.location.GnssClock;
 import android.location.GnssMeasurement;
 import android.location.GnssMeasurementsEvent;
 import android.location.GnssStatus;
@@ -19,10 +20,11 @@ public class GnssMeasurementCollector {
 
     private static final String TAG = "GnssMeasCollector";
 
-    // L1: 1575.42 MHz, L5: 1176.45 MHz
     private static final double L1_FREQ_HZ = 1575.42e6;
     private static final double L5_FREQ_HZ = 1176.45e6;
     private static final double FREQ_TOLERANCE_HZ = 10e6;
+    private static final double SPEED_OF_LIGHT = 299792458.0;
+    private static final double GPS_WEEK_NANOS = 604800.0 * 1e9;
 
     public interface Listener {
         void onMeasurementsReceived(List<SatelliteMeasurement> measurements);
@@ -37,7 +39,11 @@ public class GnssMeasurementCollector {
     private GnssStatus lastGnssStatus;
     private boolean isCollecting = false;
 
-    private final GnssMeasurementsEvent.Callback measurementCallback = new GnssMeasurementsEvent.Callback() {
+    // Current GPS time-of-week (seconds), updated each epoch
+    private double currentTow = 0;
+
+    private final GnssMeasurementsEvent.Callback measurementCallback =
+            new GnssMeasurementsEvent.Callback() {
         @Override
         public void onGnssMeasurementsReceived(GnssMeasurementsEvent event) {
             processMeasurements(event);
@@ -48,18 +54,14 @@ public class GnssMeasurementCollector {
         @Override
         public void onSatelliteStatusChanged(GnssStatus status) {
             lastGnssStatus = status;
-            for (Listener l : listeners) {
-                l.onGnssStatusChanged(status);
-            }
+            for (Listener l : listeners) l.onGnssStatusChanged(status);
         }
     };
 
     private final LocationListener locationListener = new LocationListener() {
         @Override
         public void onLocationChanged(Location location) {
-            for (Listener l : listeners) {
-                l.onLocationUpdated(location);
-            }
+            for (Listener l : listeners) l.onLocationUpdated(location);
         }
     };
 
@@ -71,39 +73,38 @@ public class GnssMeasurementCollector {
     public void start() {
         if (isCollecting) return;
         isCollecting = true;
-
-        locationManager.requestLocationUpdates(
-                LocationManager.GPS_PROVIDER, 1000, 0, locationListener);
+        locationManager.requestLocationUpdates(LocationManager.GPS_PROVIDER, 1000, 0, locationListener);
         locationManager.registerGnssMeasurementsCallback(measurementCallback, mainHandler);
         locationManager.registerGnssStatusCallback(gnssStatusCallback, mainHandler);
-
-        Log.i(TAG, "GNSS measurement collection started");
+        Log.i(TAG, "GNSS collection started");
     }
 
     public void stop() {
         if (!isCollecting) return;
         isCollecting = false;
-
         locationManager.removeUpdates(locationListener);
         locationManager.unregisterGnssMeasurementsCallback(measurementCallback);
         locationManager.unregisterGnssStatusCallback(gnssStatusCallback);
-
-        Log.i(TAG, "GNSS measurement collection stopped");
+        Log.i(TAG, "GNSS collection stopped");
     }
 
-    public void addListener(Listener listener) {
-        listeners.add(listener);
-    }
-
-    public void removeListener(Listener listener) {
-        listeners.remove(listener);
-    }
-
-    public GnssStatus getLastGnssStatus() {
-        return lastGnssStatus;
-    }
+    public void addListener(Listener listener) { listeners.add(listener); }
+    public void removeListener(Listener listener) { listeners.remove(listener); }
+    public GnssStatus getLastGnssStatus() { return lastGnssStatus; }
+    public double getCurrentTow() { return currentTow; }
 
     private void processMeasurements(GnssMeasurementsEvent event) {
+        GnssClock clock = event.getClock();
+
+        // Compute receiver GPS time in nanoseconds
+        double tRxNanos = clock.getTimeNanos()
+                - (clock.hasFullBiasNanos() ? clock.getFullBiasNanos() : 0)
+                - (clock.hasBiasNanos() ? clock.getBiasNanos() : 0.0);
+
+        // GPS time-of-week (seconds)
+        double tRxInWeekNanos = tRxNanos % GPS_WEEK_NANOS;
+        currentTow = tRxInWeekNanos * 1e-9;
+
         List<SatelliteMeasurement> measurements = new ArrayList<>();
 
         for (GnssMeasurement m : event.getMeasurements()) {
@@ -115,11 +116,12 @@ public class GnssMeasurementCollector {
             sat.carrierFreqHz = m.hasCarrierFrequencyHz() ? m.getCarrierFrequencyHz() : L1_FREQ_HZ;
             sat.isL1 = isL1(sat.carrierFreqHz);
             sat.isL5 = isL5(sat.carrierFreqHz);
-            sat.pseudorangeMeters = computePseudorange(m);
-            sat.carrierPhaseRadians = m.getAccumulatedDeltaRangeMeters();
+            sat.pseudorangeMeters = computePseudorange(m, tRxInWeekNanos);
+            sat.carrierPhaseMeters = m.getAccumulatedDeltaRangeMeters();
             sat.cnrDbHz = m.getCn0DbHz();
             sat.elevationDeg = getElevationFromStatus(sat.svid, sat.constellationType);
-            sat.timeNanos = m.getTimeOffsetNanos();
+            sat.azimuthDeg = getAzimuthFromStatus(sat.svid, sat.constellationType);
+            sat.towSeconds = currentTow;
             sat.multipath = (m.getMultipathIndicator() == GnssMeasurement.MULTIPATH_INDICATOR_DETECTED);
 
             logMeasurement(sat);
@@ -127,60 +129,60 @@ public class GnssMeasurementCollector {
         }
 
         if (!measurements.isEmpty()) {
-            for (Listener l : listeners) {
-                l.onMeasurementsReceived(measurements);
-            }
+            for (Listener l : listeners) l.onMeasurementsReceived(measurements);
         }
+    }
+
+    private double computePseudorange(GnssMeasurement m, double tRxInWeekNanos) {
+        // Add per-measurement time offset to receiver time
+        double tRxWithOffset = tRxInWeekNanos + m.getTimeOffsetNanos();
+
+        // Satellite transmission time (GPS time-of-week, nanoseconds)
+        double tTxNanos = m.getReceivedSvTimeNanos();
+
+        double dtNanos = tRxWithOffset - tTxNanos;
+
+        // Handle week boundary crossings
+        if (dtNanos < 0) dtNanos += GPS_WEEK_NANOS;
+        if (dtNanos > GPS_WEEK_NANOS / 2) dtNanos -= GPS_WEEK_NANOS;
+
+        return dtNanos * 1e-9 * SPEED_OF_LIGHT;
     }
 
     private boolean isUsable(GnssMeasurement m) {
         int state = m.getState();
-        // Need at least pseudorange decoded
         return (state & GnssMeasurement.STATE_CODE_LOCK) != 0
                 && (state & GnssMeasurement.STATE_TOW_DECODED) != 0;
     }
 
-    private boolean isL1(double freqHz) {
-        return Math.abs(freqHz - L1_FREQ_HZ) < FREQ_TOLERANCE_HZ;
-    }
+    private boolean isL1(double f) { return Math.abs(f - L1_FREQ_HZ) < FREQ_TOLERANCE_HZ; }
+    private boolean isL5(double f) { return Math.abs(f - L5_FREQ_HZ) < FREQ_TOLERANCE_HZ; }
 
-    private boolean isL5(double freqHz) {
-        return Math.abs(freqHz - L5_FREQ_HZ) < FREQ_TOLERANCE_HZ;
-    }
-
-    private double computePseudorange(GnssMeasurement m) {
-        // pseudorange = (receivedSvTimeNs - timeOffsetNs) * c / 1e9
-        double receivedSvTimeSeconds = m.getReceivedSvTimeNanos() * 1e-9;
-        double timeOffsetSeconds = m.getTimeOffsetNanos() * 1e-9;
-        double tRx = receivedSvTimeSeconds - timeOffsetSeconds;
-        // tRx is in GPS week seconds; wrap to handle week rollover
-        tRx = tRx % (7 * 24 * 3600);
-        double tTx = m.getReceivedSvTimeNanos() * 1e-9;
-        tTx = tTx % (7 * 24 * 3600);
-        double deltaT = tRx - tTx;
-        return deltaT * 299792458.0;
-    }
-
-    private float getElevationFromStatus(int svid, int constellationType) {
+    private float getElevationFromStatus(int svid, int constellation) {
         if (lastGnssStatus == null) return 0f;
         for (int i = 0; i < lastGnssStatus.getSatelliteCount(); i++) {
             if (lastGnssStatus.getSvid(i) == svid
-                    && lastGnssStatus.getConstellationType(i) == constellationType) {
+                    && lastGnssStatus.getConstellationType(i) == constellation)
                 return lastGnssStatus.getElevationDegrees(i);
-            }
+        }
+        return 0f;
+    }
+
+    private float getAzimuthFromStatus(int svid, int constellation) {
+        if (lastGnssStatus == null) return 0f;
+        for (int i = 0; i < lastGnssStatus.getSatelliteCount(); i++) {
+            if (lastGnssStatus.getSvid(i) == svid
+                    && lastGnssStatus.getConstellationType(i) == constellation)
+                return lastGnssStatus.getAzimuthDegrees(i);
         }
         return 0f;
     }
 
     private void logMeasurement(SatelliteMeasurement sat) {
         Log.d(TAG, String.format(
-                "SV=%d Const=%d Freq=%.2fMHz L1=%b L5=%b PR=%.2fm CNR=%.1fdBHz El=%.1f°",
-                sat.svid, sat.constellationType,
-                sat.carrierFreqHz / 1e6,
-                sat.isL1, sat.isL5,
-                sat.pseudorangeMeters,
-                sat.cnrDbHz,
-                sat.elevationDeg));
+                "SV=%d Const=%d Freq=%.2fMHz L1=%b L5=%b PR=%.3fm CNR=%.1fdBHz El=%.1f°",
+                sat.svid, sat.constellationType, sat.carrierFreqHz / 1e6,
+                sat.isL1, sat.isL5, sat.pseudorangeMeters, sat.cnrDbHz, sat.elevationDeg));
     }
 
     public static class SatelliteMeasurement {
@@ -190,10 +192,11 @@ public class GnssMeasurementCollector {
         public boolean isL1;
         public boolean isL5;
         public double pseudorangeMeters;
-        public double carrierPhaseRadians;
+        public double carrierPhaseMeters;
         public double cnrDbHz;
         public float elevationDeg;
-        public double timeNanos;
+        public float azimuthDeg;
+        public double towSeconds;
         public boolean multipath;
     }
 }

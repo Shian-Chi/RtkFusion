@@ -4,6 +4,7 @@ import android.Manifest;
 import android.content.ComponentName;
 import android.content.Intent;
 import android.content.ServiceConnection;
+import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
 import android.location.GnssStatus;
 import android.location.Location;
@@ -17,6 +18,7 @@ import android.widget.Toast;
 import androidx.annotation.NonNull;
 import androidx.appcompat.app.AppCompatActivity;
 import androidx.core.app.ActivityCompat;
+import androidx.fragment.app.Fragment;
 import androidx.fragment.app.FragmentTransaction;
 
 import com.example.rtkgnss.R;
@@ -25,6 +27,7 @@ import com.example.rtkgnss.data.PositionRepository;
 import com.example.rtkgnss.fusion.ExtendedKalmanFilter;
 import com.example.rtkgnss.fusion.ImuCollector;
 import com.example.rtkgnss.gnss.DualFrequencyCorrector;
+import com.example.rtkgnss.gnss.EphemerisProcessor;
 import com.example.rtkgnss.gnss.GnssMeasurementCollector;
 import com.example.rtkgnss.gnss.HatchFilter;
 import com.example.rtkgnss.gnss.MultipathDetector;
@@ -50,32 +53,34 @@ public class MapActivity extends AppCompatActivity
     private static final String TAG = "MapActivity";
     private static final int PERM_REQUEST = 100;
 
-    // --- GNSS pipeline ---
+    // Pipeline components
     private GnssMeasurementCollector measurementCollector;
     private DualFrequencyCorrector dualFreqCorrector;
     private HatchFilter hatchFilter;
     private MultipathDetector multipathDetector;
     private CorrectionApplier correctionApplier;
+    private EphemerisProcessor ephemerisProcessor;
 
-    // --- Fusion ---
+    // Fusion
     private ImuCollector imuCollector;
     private ExtendedKalmanFilter ekf;
 
-    // --- Data ---
+    // Data
     private PositionRepository positionRepository;
     private LogExporter logExporter;
 
-    // --- NTRIP ---
+    // NTRIP
     private NtripClient ntripService;
     private boolean ntripBound = false;
     private final RtcmParser rtcmParser = new RtcmParser();
 
-    // --- UI ---
+    // UI
     private MapView mapView;
     private Marker positionMarker;
     private Polyline trackPolyline;
     private final List<GeoPoint> trackPoints = new ArrayList<>();
     private StatusFragment statusFragment;
+    private SkyViewFragment skyViewFragment;
 
     private Location lastRawLocation;
 
@@ -84,37 +89,41 @@ public class MapActivity extends AppCompatActivity
         public void onServiceConnected(ComponentName name, IBinder service) {
             ntripBound = true;
             ntripService = ((NtripClient.LocalBinder) service).getService();
-            ntripService.addRtcmListener(rtcmParser::feed);
+            ntripService.addRtcmListener((data, length) -> rtcmParser.feed(data, length));
+            applyNtripSettings();
             Log.i(TAG, "NTRIP service bound");
         }
         @Override
         public void onServiceDisconnected(ComponentName name) {
             ntripBound = false;
+            ntripService = null;
         }
     };
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
-
         Configuration.getInstance().setUserAgentValue(getPackageName());
         setContentView(R.layout.activity_map);
 
-        initAlgorithms();
+        initPipeline();
         initUi();
         checkPermissionsAndStart();
     }
 
-    private void initAlgorithms() {
+    private void initPipeline() {
         dualFreqCorrector = new DualFrequencyCorrector();
         hatchFilter = new HatchFilter();
         multipathDetector = new MultipathDetector();
         correctionApplier = new CorrectionApplier();
+        ephemerisProcessor = new EphemerisProcessor();
         ekf = new ExtendedKalmanFilter();
         positionRepository = new PositionRepository();
         logExporter = new LogExporter(this);
 
+        // Wire RTCM listeners: corrections and ephemeris both parse RTCM stream
         rtcmParser.addListener(correctionApplier);
+        rtcmParser.addListener(ephemerisProcessor);
     }
 
     private void initUi() {
@@ -131,20 +140,18 @@ public class MapActivity extends AppCompatActivity
         trackPolyline.setWidth(4f);
         mapView.getOverlays().add(trackPolyline);
 
+        // Status panel (bottom)
         statusFragment = new StatusFragment();
-        FragmentTransaction ft = getSupportFragmentManager().beginTransaction();
-        ft.replace(R.id.status_container, statusFragment);
-        ft.commit();
+        getSupportFragmentManager().beginTransaction()
+                .replace(R.id.status_container, statusFragment)
+                .commit();
     }
 
     private void checkPermissionsAndStart() {
-        String[] perms = {
-                Manifest.permission.ACCESS_FINE_LOCATION,
-                Manifest.permission.WRITE_EXTERNAL_STORAGE
-        };
         if (ActivityCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION)
                 != PackageManager.PERMISSION_GRANTED) {
-            ActivityCompat.requestPermissions(this, perms, PERM_REQUEST);
+            ActivityCompat.requestPermissions(this,
+                    new String[]{Manifest.permission.ACCESS_FINE_LOCATION}, PERM_REQUEST);
         } else {
             startCollection();
         }
@@ -174,64 +181,69 @@ public class MapActivity extends AppCompatActivity
         imuCollector.addListener(this);
         imuCollector.start();
 
-        bindService(new Intent(this, NtripClient.class),
-                ntripConnection, BIND_AUTO_CREATE);
+        Intent ntripIntent = new Intent(this, NtripClient.class);
+        startForegroundService(ntripIntent);
+        bindService(ntripIntent, ntripConnection, BIND_AUTO_CREATE);
 
         try {
             logExporter.startNewSession();
         } catch (IOException e) {
-            Log.e(TAG, "Could not start log: " + e.getMessage());
+            Log.e(TAG, "Log start failed: " + e.getMessage());
         }
     }
 
-    // --- GnssMeasurementCollector.Listener ---
+    // -------------------------------------------------------------------------
+    // GnssMeasurementCollector.Listener
+    // -------------------------------------------------------------------------
 
     @Override
     public void onMeasurementsReceived(List<GnssMeasurementCollector.SatelliteMeasurement> measurements) {
-        // 1. Dual-frequency ionosphere correction
         Map<Integer, DualFrequencyCorrector.CorrectedMeasurement> corrected =
                 dualFreqCorrector.correct(measurements);
 
         boolean anyDualFreq = false;
         boolean anyRtcm = false;
+        double tow = measurementCollector.getCurrentTow();
 
         for (DualFrequencyCorrector.CorrectedMeasurement cm : corrected.values()) {
             if (cm.isDualFreq) anyDualFreq = true;
 
-            // 2. Hatch filter (carrier-phase smoothing)
+            // Carrier-phase smoothing (Hatch filter)
             HatchFilter.SmoothedPseudorange smoothed = hatchFilter.update(
                     cm.svid, cm.constellationType,
-                    cm.pseudorangeMeters, cm.pseudorangeMeters);
-
+                    cm.pseudorangeMeters,
+                    getCarrierPhaseForSv(measurements, cm.svid, cm.constellationType));
             if (!smoothed.isReady) continue;
 
-            // 3. Multipath detection / weighting
+            // Multipath / elevation weighting
             MultipathDetector.WeightedMeasurement wm = multipathDetector.evaluate(
                     smoothed.smoothedPseudorangeMeters, cm.cnrDbHz,
                     cm.elevationDeg, cm.multipath);
-
             if (wm.excluded) continue;
 
-            // 4. Apply NTRIP differential correction
+            // RTCM differential correction
             double finalPR = correctionApplier.applyCorrection(cm.svid, wm.pseudorangeMeters);
             if (correctionApplier.hasCorrectionFor(cm.svid)) anyRtcm = true;
 
-            // 5. EKF update — SV position from last known location (simplified)
-            //    In production, use proper ephemeris to compute SV ECEF position
-            if (ekf.isInitialized() && lastRawLocation != null) {
-                double[] svEcef = estimateSvEcef(cm.svid, cm.elevationDeg);
-                ekf.updateWithPseudorange(svEcef[0], svEcef[1], svEcef[2], finalPR, wm.weight);
+            // EKF update using ephemeris-derived SV position
+            if (ekf.isInitialized()) {
+                double[] svEcef = ephemerisProcessor.getSvEcef(cm.svid, tow);
+                if (svEcef != null) {
+                    // Apply SV clock correction to pseudorange
+                    double correctedPR = finalPR - svEcef[3];
+                    ekf.updateWithPseudorange(svEcef[0], svEcef[1], svEcef[2],
+                            correctedPR, wm.weight);
+                }
             }
         }
 
-        updatePositionDisplay(anyDualFreq, anyRtcm, corrected.size());
+        publishPosition(anyDualFreq, anyRtcm, corrected.size());
     }
 
     @Override
     public void onGnssStatusChanged(GnssStatus status) {
-        if (statusFragment != null) {
-            statusFragment.updateSatelliteStatus(status);
-        }
+        if (statusFragment != null) statusFragment.updateSatelliteStatus(status);
+        if (skyViewFragment != null) skyViewFragment.updateStatus(status);
     }
 
     @Override
@@ -249,27 +261,44 @@ public class MapActivity extends AppCompatActivity
         }
     }
 
-    // --- ImuCollector.ImuListener ---
+    // -------------------------------------------------------------------------
+    // ImuCollector.ImuListener
+    // -------------------------------------------------------------------------
 
     @Override
     public void onImuSample(ImuCollector.ImuSample sample) {
         ekf.predict(sample);
     }
 
-    // --- UI update ---
+    // -------------------------------------------------------------------------
+    // Position publishing
+    // -------------------------------------------------------------------------
 
-    private void updatePositionDisplay(boolean dualFreq, boolean rtcm, int satCount) {
-        ExtendedKalmanFilter.EkfResult result = ekf.getResult();
-        if (!ekf.isInitialized() || lastRawLocation == null) return;
+    private void publishPosition(boolean dualFreq, boolean rtcm, int satCount) {
+        if (lastRawLocation == null) return;
 
-        double[] correctedLlh = ecefToWgs84(result.x, result.y, result.z);
+        double[] correctedLlh;
+        double uncertainty;
+
+        if (ekf.isInitialized()) {
+            ExtendedKalmanFilter.EkfResult result = ekf.getResult();
+            correctedLlh = ecefToWgs84(result.x, result.y, result.z);
+            uncertainty = result.positionUncertaintyM;
+        } else {
+            correctedLlh = new double[]{
+                    lastRawLocation.getLatitude(),
+                    lastRawLocation.getLongitude(),
+                    lastRawLocation.getAltitude()
+            };
+            uncertainty = lastRawLocation.getAccuracy();
+        }
 
         PositionRepository.PositionEntry entry = new PositionRepository.PositionEntry(
                 System.currentTimeMillis(),
                 lastRawLocation.getLatitude(), lastRawLocation.getLongitude(),
                 lastRawLocation.getAltitude(),
                 correctedLlh[0], correctedLlh[1], correctedLlh[2],
-                result.positionUncertaintyM, satCount, dualFreq, rtcm);
+                uncertainty, satCount, dualFreq, rtcm);
 
         positionRepository.addEntry(entry);
         logExporter.appendEntry(entry);
@@ -277,17 +306,19 @@ public class MapActivity extends AppCompatActivity
         runOnUiThread(() -> {
             GeoPoint gp = new GeoPoint(correctedLlh[0], correctedLlh[1]);
             positionMarker.setPosition(gp);
-            mapView.getController().animateTo(gp);
+            mapView.getController().setCenter(gp);
 
             trackPoints.add(gp);
-            trackPolyline.setPoints(trackPoints);
+            trackPolyline.setPoints(new ArrayList<>(trackPoints));
             mapView.invalidate();
 
-            if (statusFragment != null) {
-                statusFragment.updatePosition(entry);
-            }
+            if (statusFragment != null) statusFragment.updatePosition(entry);
         });
     }
+
+    // -------------------------------------------------------------------------
+    // Menu
+    // -------------------------------------------------------------------------
 
     @Override
     public boolean onCreateOptionsMenu(Menu menu) {
@@ -297,16 +328,24 @@ public class MapActivity extends AppCompatActivity
 
     @Override
     public boolean onOptionsItemSelected(MenuItem item) {
-        if (item.getItemId() == R.id.action_export) {
-            try {
-                logExporter.exportAll(positionRepository.getHistory());
-                Toast.makeText(this, "Log exported", Toast.LENGTH_SHORT).show();
-            } catch (IOException e) {
-                Toast.makeText(this, "Export failed: " + e.getMessage(), Toast.LENGTH_SHORT).show();
-            }
+        int id = item.getItemId();
+        if (id == R.id.action_settings) {
+            startActivity(new Intent(this, SettingsActivity.class));
             return true;
         }
-        if (item.getItemId() == R.id.action_clear) {
+        if (id == R.id.action_skyview) {
+            toggleSkyView();
+            return true;
+        }
+        if (id == R.id.action_ntrip_connect) {
+            toggleNtrip(item);
+            return true;
+        }
+        if (id == R.id.action_export) {
+            exportLog();
+            return true;
+        }
+        if (id == R.id.action_clear) {
             trackPoints.clear();
             trackPolyline.setPoints(trackPoints);
             positionRepository.clear();
@@ -316,10 +355,68 @@ public class MapActivity extends AppCompatActivity
         return super.onOptionsItemSelected(item);
     }
 
+    private void toggleSkyView() {
+        Fragment existing = getSupportFragmentManager().findFragmentByTag("skyview");
+        if (existing != null) {
+            getSupportFragmentManager().beginTransaction().remove(existing).commit();
+            skyViewFragment = null;
+        } else {
+            skyViewFragment = new SkyViewFragment();
+            getSupportFragmentManager().beginTransaction()
+                    .add(R.id.skyview_container, skyViewFragment, "skyview")
+                    .commit();
+        }
+    }
+
+    private boolean ntripConnected = false;
+
+    private void toggleNtrip(MenuItem item) {
+        if (!ntripBound || ntripService == null) return;
+        if (ntripConnected) {
+            ntripService.disconnect();
+            ntripConnected = false;
+            item.setTitle("Connect NTRIP");
+        } else {
+            applyNtripSettings();
+            ntripService.connect();
+            ntripConnected = true;
+            item.setTitle("Disconnect NTRIP");
+        }
+    }
+
+    private void applyNtripSettings() {
+        if (ntripService == null) return;
+        SharedPreferences prefs = getSharedPreferences(
+                SettingsActivity.PREFS_NAME, MODE_PRIVATE);
+        String host = prefs.getString(SettingsActivity.KEY_HOST, "");
+        int port = prefs.getInt(SettingsActivity.KEY_PORT, 2101);
+        String mount = prefs.getString(SettingsActivity.KEY_MOUNT, "");
+        String user = prefs.getString(SettingsActivity.KEY_USER, "");
+        String pass = prefs.getString(SettingsActivity.KEY_PASS, "");
+        if (!host.isEmpty() && !mount.isEmpty()) {
+            ntripService.configure(host, port, mount, user, pass);
+        }
+    }
+
+    private void exportLog() {
+        try {
+            logExporter.exportAll(positionRepository.getHistory());
+            Toast.makeText(this, "Log exported to Documents/RtkFusion/", Toast.LENGTH_SHORT).show();
+        } catch (IOException e) {
+            Toast.makeText(this, "Export failed: " + e.getMessage(), Toast.LENGTH_SHORT).show();
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Lifecycle
+    // -------------------------------------------------------------------------
+
     @Override
     protected void onResume() {
         super.onResume();
         mapView.onResume();
+        // Re-apply settings if they changed
+        if (ntripBound) applyNtripSettings();
     }
 
     @Override
@@ -334,62 +431,51 @@ public class MapActivity extends AppCompatActivity
         if (measurementCollector != null) measurementCollector.stop();
         if (imuCollector != null) imuCollector.stop();
         if (ntripBound) {
+            ntripService.disconnect();
             unbindService(ntripConnection);
             ntripBound = false;
         }
         logExporter.closeSession();
     }
 
-    // --- Coordinate conversions ---
+    // -------------------------------------------------------------------------
+    // Helpers
+    // -------------------------------------------------------------------------
+
+    private double getCarrierPhaseForSv(
+            List<GnssMeasurementCollector.SatelliteMeasurement> measurements,
+            int svid, int constellation) {
+        for (GnssMeasurementCollector.SatelliteMeasurement m : measurements) {
+            if (m.svid == svid && m.constellationType == constellation && m.isL1) {
+                return m.carrierPhaseMeters;
+            }
+        }
+        return 0;
+    }
 
     private double[] wgs84ToEcef(double latDeg, double lonDeg, double altM) {
-        double a = 6378137.0;
-        double e2 = 0.00669437999014;
-        double lat = Math.toRadians(latDeg);
-        double lon = Math.toRadians(lonDeg);
+        final double a = 6378137.0, e2 = 0.00669437999014;
+        double lat = Math.toRadians(latDeg), lon = Math.toRadians(lonDeg);
         double N = a / Math.sqrt(1 - e2 * Math.sin(lat) * Math.sin(lat));
-        double x = (N + altM) * Math.cos(lat) * Math.cos(lon);
-        double y = (N + altM) * Math.cos(lat) * Math.sin(lon);
-        double z = (N * (1 - e2) + altM) * Math.sin(lat);
-        return new double[]{x, y, z};
+        return new double[]{
+                (N + altM) * Math.cos(lat) * Math.cos(lon),
+                (N + altM) * Math.cos(lat) * Math.sin(lon),
+                (N * (1 - e2) + altM) * Math.sin(lat)
+        };
     }
 
     private double[] ecefToWgs84(double x, double y, double z) {
-        double a = 6378137.0;
-        double e2 = 0.00669437999014;
+        final double a = 6378137.0, e2 = 0.00669437999014;
         double lon = Math.atan2(y, x);
         double p = Math.sqrt(x * x + y * y);
         double lat = Math.atan2(z, p * (1 - e2));
         for (int i = 0; i < 10; i++) {
-            double N = a / Math.sqrt(1 - e2 * Math.sin(lat) * Math.sin(lat));
-            lat = Math.atan2(z + e2 * N * Math.sin(lat), p);
+            double sinLat = Math.sin(lat);
+            double N = a / Math.sqrt(1 - e2 * sinLat * sinLat);
+            lat = Math.atan2(z + e2 * N * sinLat, p);
         }
         double N = a / Math.sqrt(1 - e2 * Math.sin(lat) * Math.sin(lat));
         double alt = p / Math.cos(lat) - N;
         return new double[]{Math.toDegrees(lat), Math.toDegrees(lon), alt};
-    }
-
-    /**
-     * Simplified SV ECEF position estimate from elevation angle.
-     * In production, replace with ephemeris-based computation.
-     */
-    private double[] estimateSvEcef(int svid, float elevDeg) {
-        if (lastRawLocation == null) return new double[]{0, 0, 0};
-        double[] rxEcef = wgs84ToEcef(lastRawLocation.getLatitude(),
-                lastRawLocation.getLongitude(), lastRawLocation.getAltitude());
-        double dist = 20200000.0; // approximate GPS orbital radius above surface
-        double elRad = Math.toRadians(Math.max(elevDeg, 5));
-        double azRad = Math.toRadians(svid * 30.0 % 360); // placeholder azimuth
-        // Local East-North-Up offset
-        double de = dist * Math.cos(elRad) * Math.sin(azRad);
-        double dn = dist * Math.cos(elRad) * Math.cos(azRad);
-        double du = dist * Math.sin(elRad);
-        double lat = Math.toRadians(lastRawLocation.getLatitude());
-        double lon = Math.toRadians(lastRawLocation.getLongitude());
-        // ENU to ECEF rotation
-        double dx = -Math.sin(lon) * de - Math.sin(lat) * Math.cos(lon) * dn + Math.cos(lat) * Math.cos(lon) * du;
-        double dy =  Math.cos(lon) * de - Math.sin(lat) * Math.sin(lon) * dn + Math.cos(lat) * Math.sin(lon) * du;
-        double dz =  Math.cos(lat) * dn + Math.sin(lat) * du;
-        return new double[]{rxEcef[0] + dx, rxEcef[1] + dy, rxEcef[2] + dz};
     }
 }

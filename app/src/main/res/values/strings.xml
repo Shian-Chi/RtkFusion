@@ -1,6 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">RtkFusion</string>
+    <string name="action_settings">NTRIP Settings</string>
     <string name="action_export">Export Log</string>
     <string name="action_clear">Clear Track</string>
 </resources>
